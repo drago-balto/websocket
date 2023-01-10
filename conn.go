@@ -277,6 +277,9 @@ type Conn struct {
 	handleClose   func(int, string) error
 	readErrCount  int
 	messageReader *messageReader // the current low-level reader
+	mr1, mr2      *messageReader // alternating readers (to avoid allocation)
+	mw            *messageWriter // current low-lever writer
+	mw1, mw2      *messageWriter // alternating writers (to avoid allocation)
 
 	readDecompress         bool // whether last read frame had RSV1 set
 	newDecompressionReader func(io.Reader) io.ReadCloser
@@ -316,6 +319,8 @@ func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, 
 		writeBufSize:           writeBufferSize,
 		enableWriteCompression: true,
 		compressionLevel:       defaultCompressionLevel,
+		mw1:                    &messageWriter{},
+		mw2:                    &messageWriter{},
 	}
 	c.SetCloseHandler(nil)
 	c.SetPingHandler(nil)
@@ -516,14 +521,25 @@ func (c *Conn) beginMessage(mw *messageWriter, messageType int) error {
 // All message types (TextMessage, BinaryMessage, CloseMessage, PingMessage and
 // PongMessage) are supported.
 func (c *Conn) NextWriter(messageType int) (io.WriteCloser, error) {
-	var mw messageWriter
-	if err := c.beginMessage(&mw, messageType); err != nil {
+	if c.mw1 == nil {
+		c.mw1 = &messageWriter{}
+	}
+	if c.mw2 == nil {
+		c.mw2 = &messageWriter{}
+	}
+	if c.mw == c.mw1 {
+		c.mw = c.mw2
+	} else {
+		c.mw = c.mw1
+	}
+	*c.mw = messageWriter{} // zero out current writer
+	if err := c.beginMessage(c.mw, messageType); err != nil {
 		return nil, err
 	}
-	c.writer = &mw
+	c.writer = c.mw
 	if c.newCompressionWriter != nil && c.enableWriteCompression && isData(messageType) {
 		w := c.newCompressionWriter(c.writer, c.compressionLevel)
-		mw.compress = true
+		c.mw.compress = true
 		c.writer = w
 	}
 	return c.writer, nil
@@ -1002,6 +1018,21 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 		c.reader = nil
 	}
 
+	if c.mr1 == nil {
+		c.mr1 = &messageReader{c: c}
+	}
+	if c.mr2 == nil {
+		c.mr2 = &messageReader{c: c}
+	}
+
+	var nextReader *messageReader
+	if c.messageReader == c.mr1 {
+		nextReader = c.mr2
+	} else {
+		nextReader = c.mr1
+	}
+	*nextReader = messageReader{c: c}
+
 	c.messageReader = nil
 	c.readLength = 0
 
@@ -1013,7 +1044,7 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 		}
 
 		if frameType == TextMessage || frameType == BinaryMessage {
-			c.messageReader = &messageReader{c}
+			c.messageReader = nextReader
 			c.reader = c.messageReader
 			if c.readDecompress {
 				c.reader = c.newDecompressionReader(c.reader)

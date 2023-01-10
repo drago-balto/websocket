@@ -1,3 +1,3 @@
-module github.com/gorilla/websocket
+module github.com/drago-balto/websocket
 
-go 1.12
+go 1.19
